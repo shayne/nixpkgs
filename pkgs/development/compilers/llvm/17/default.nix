@@ -123,7 +123,7 @@ in let
     then tools.bintools
     else bootBintools;
 
-  in {
+  in rec {
 
     libllvm = callPackage ./llvm {
       inherit llvm_meta;
@@ -190,6 +190,9 @@ in let
         cp -r ${monorepoSrc}/cmake "$out"
         cp -r ${monorepoSrc}/lldb "$out"
       '') { };
+      cmakeFlags = [
+        "-DCLANG_RESOURCE_DIR=../../../../${libclang.lib}"
+      ];
       patches =
         [
           # FIXME: do we need this? ./procfs.patch

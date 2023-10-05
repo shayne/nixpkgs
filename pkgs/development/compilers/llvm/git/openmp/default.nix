@@ -11,6 +11,7 @@
 , clang-unwrapped
 , perl
 , pkg-config
+, xcbuild
 , version
 }:
 
@@ -27,7 +28,6 @@ stdenv.mkDerivation rec {
   sourceRoot = "${src.name}/${pname}";
 
   patches = [
-    ./fix-find-tool.patch
     ./gnu-install-dirs.patch
     ./run-lit-directly.patch
   ];
@@ -38,6 +38,8 @@ stdenv.mkDerivation rec {
   buildInputs = [
     (if stdenv.buildPlatform == stdenv.hostPlatform then llvm else targetLlvm)
   ];
+
+  nativeCheckInputs = lib.optional stdenv.hostPlatform.isDarwin xcbuild.xcrun;
 
   # Unsup:Pass:XFail:Fail
   # 26:267:16:8

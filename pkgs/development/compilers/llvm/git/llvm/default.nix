@@ -7,8 +7,10 @@
 , darwin
 , ninja
 , python3
+, python3Packages
 , libffi
-, enableGoldPlugin ? (!stdenv.isDarwin && !stdenv.targetPlatform.isWasi)
+# TODO: Gold plugin on LLVM16 has a severe memory corruption bug: https://github.com/llvm/llvm-project/issues/61350.
+, enableGoldPlugin ? false
 , libbfd
 , libpfm
 , libxml2
@@ -56,12 +58,17 @@ let
   # So, we "manually" assemble one python derivation for the package to depend
   # on, taking into account whether checks are enabled or not:
   python = if doCheck then
+    # Note that we _explicitly_ ask for a python interpreter for our host
+    # platform here; the splicing that would ordinarily take care of this for
+    # us does not seem to work once we use `withPackages`.
     let
       checkDeps = ps: with ps; [ psutil ];
-    in python3.withPackages checkDeps
+    in pkgsBuildBuild.targetPackages.python3.withPackages checkDeps
   else python3;
 
-in stdenv.mkDerivation (rec {
+in
+  assert (lib.assertMsg (!enableGoldPlugin) "Gold plugin cannot be enabled on LLVM16 due to a upstream issue: https://github.com/llvm/llvm-project/issues/61350");
+  stdenv.mkDerivation (rec {
   pname = "llvm";
   inherit version;
 
@@ -80,7 +87,11 @@ in stdenv.mkDerivation (rec {
   outputs = [ "out" "lib" "dev" "python" ];
 
   nativeBuildInputs = [ cmake ninja python ]
-    ++ optionals enableManpages [ python3.pkgs.sphinx python3.pkgs.recommonmark ];
+    ++ optionals enableManpages [
+      # Note: we intentionally use `python3Packages` instead of `python3.pkgs`;
+      # splicing does *not* work with the latter. (TODO: fix)
+      python3Packages.sphinx python3Packages.recommonmark
+    ];
 
   buildInputs = [ libxml2 libffi ]
     ++ optional enablePFM libpfm; # exegesis
@@ -94,34 +105,6 @@ in stdenv.mkDerivation (rec {
   patches = [
     ./gnu-install-dirs.patch
 
-    # Running the tests involves invoking binaries (like `opt`) that depend on
-    # the LLVM dylibs and reference them by absolute install path (i.e. their
-    # nix store path).
-    #
-    # Because we have not yet run the install phase (we're running these tests
-    # as part of `checkPhase` instead of `installCheckPhase`) these absolute
-    # paths do not exist yet; to work around this we point the loader (`ld` on
-    # unix, `dyld` on macOS) at the `lib` directory which will later become this
-    # package's `lib` output.
-    #
-    # Previously we would just set `LD_LIBRARY_PATH` to include the build `lib`
-    # dir but:
-    #   - this doesn't generalize well to other platforms; `lit` doesn't forward
-    #     `DYLD_LIBRARY_PATH` (macOS):
-    #     + https://github.com/llvm/llvm-project/blob/0d89963df354ee309c15f67dc47c8ab3cb5d0fb2/llvm/utils/lit/lit/TestingConfig.py#L26
-    #   - even if `lit` forwarded this env var, we actually cannot set
-    #     `DYLD_LIBRARY_PATH` in the child processes `lit` launches because
-    #     `DYLD_LIBRARY_PATH` (and `DYLD_FALLBACK_LIBRARY_PATH`) is cleared for
-    #     "protected processes" (i.e. the python interpreter that runs `lit`):
-    #     https://stackoverflow.com/a/35570229
-    #   - other LLVM subprojects deal with this issue by having their `lit`
-    #     configuration set these env vars for us; it makes sense to do the same
-    #     for LLVM:
-    #     + https://github.com/llvm/llvm-project/blob/4c106cfdf7cf7eec861ad3983a3dd9a9e8f3a8ae/clang-tools-extra/test/Unit/lit.cfg.py#L22-L31
-    #
-    # !!! TODO: look into upstreaming this patch
-    ./llvm-lit-cfg-add-libs-to-dylib-path.patch
-
     # `lit` has a mode where it executes run lines as a shell script which is
     # constructs; this is problematic for macOS because it means that there's
     # another process in between `lit` and the binaries being tested. As noted
@@ -134,13 +117,6 @@ in stdenv.mkDerivation (rec {
     # It's not clear to me why this isn't an issue for LLVM developers running
     # on macOS (nothing about this _seems_ nix specific)..
     ./lit-shell-script-runner-set-dyld-library-path.patch
-
-    # Fix musl build.
-    (fetchpatch {
-      url = "https://github.com/llvm/llvm-project/commit/5cd554303ead0f8891eee3cd6d25cb07f5a7bf67.patch";
-      relative = "llvm";
-      hash = "sha256-XPbvNJ45SzjMGlNUgt/IgEvM2dHQpDOe6woUJY+nUYA=";
-    })
   ] ++ lib.optionals enablePolly [
     ./gnu-install-dirs-polly.patch
 
@@ -152,29 +128,28 @@ in stdenv.mkDerivation (rec {
     substituteInPlace cmake/modules/AddLLVM.cmake \
       --replace 'set(_install_name_dir INSTALL_NAME_DIR "@rpath")' "set(_install_name_dir)" \
       --replace 'set(_install_rpath "@loader_path/../''${CMAKE_INSTALL_LIBDIR}''${LLVM_LIBDIR_SUFFIX}" ''${extra_libdir})' ""
+
     # As of LLVM 15, marked as XFAIL on arm64 macOS but lit doesn't seem to pick
     # this up: https://github.com/llvm/llvm-project/blob/c344d97a125b18f8fed0a64aace73c49a870e079/llvm/test/MC/ELF/cfi-version.ll#L7
     rm test/MC/ELF/cfi-version.ll
 
     # This test tries to call `sw_vers` by absolute path (`/usr/bin/sw_vers`)
     # and thus fails under the sandbox:
-    substituteInPlace unittests/Support/Host.cpp \
+    substituteInPlace unittests/TargetParser/Host.cpp \
       --replace '/usr/bin/sw_vers' "${(builtins.toString darwin.DarwinTools) + "/bin/sw_vers" }"
-   '' + optionalString (stdenv.isDarwin && stdenv.hostPlatform.isx86) ''
+
     # This test tries to call the intrinsics `@llvm.roundeven.f32` and
     # `@llvm.roundeven.f64` which seem to (incorrectly?) lower to `roundevenf`
-    # and `roundeven` on x86_64 macOS.
+    # and `roundeven` on macOS.
     #
     # However these functions are glibc specific so the test fails:
     #   - https://www.gnu.org/software/gnulib/manual/html_node/roundevenf.html
     #   - https://www.gnu.org/software/gnulib/manual/html_node/roundeven.html
     #
-    # TODO(@rrbutani): this seems to run fine on `aarch64-darwin`, why does it
-    # pass there?
     substituteInPlace test/ExecutionEngine/Interpreter/intrinsics.ll \
       --replace "%roundeven32 = call float @llvm.roundeven.f32(float 0.000000e+00)" "" \
       --replace "%roundeven64 = call double @llvm.roundeven.f64(double 0.000000e+00)" ""
-
+  '' + optionalString (stdenv.isDarwin && stdenv.hostPlatform.isx86) ''
     # This test fails on darwin x86_64 because `sw_vers` reports a different
     # macOS version than what LLVM finds by reading
     # `/System/Library/CoreServices/SystemVersion.plist` (which is passed into
@@ -203,13 +178,13 @@ in stdenv.mkDerivation (rec {
     # not clear to me when/where/for what this even gets used in LLVM.
     #
     # TODO(@rrbutani): fix/follow-up
-    substituteInPlace unittests/Support/Host.cpp \
+    substituteInPlace unittests/TargetParser/Host.cpp \
       --replace "getMacOSHostVersion" "DISABLED_getMacOSHostVersion"
 
     # This test fails with a `dysmutil` crash; have not yet dug into what's
     # going on here (TODO(@rrbutani)).
     rm test/tools/dsymutil/ARM/obfuscated.test
-    '' + ''
+  '' + ''
     # FileSystem permissions tests fail with various special bits
     substituteInPlace unittests/Support/CMakeLists.txt \
       --replace "Path.cpp" ""
@@ -321,7 +296,7 @@ in stdenv.mkDerivation (rec {
     "-DSPHINX_OUTPUT_MAN=ON"
     "-DSPHINX_OUTPUT_HTML=OFF"
     "-DSPHINX_WARNINGS_AS_ERRORS=OFF"
-  ] ++ optionals (enableGoldPlugin) [
+  ] ++ optionals (false) [
     "-DLLVM_BINUTILS_INCDIR=${libbfd.dev}/include"
   ] ++ optionals isDarwin [
     "-DLLVM_ENABLE_LIBCXX=ON"

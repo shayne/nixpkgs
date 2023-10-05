@@ -22,8 +22,9 @@
 , src ? null
 , monorepoSrc ? null
 , patches ? [ ]
+, cmakeFlags ? [ ]
 , enableManpages ? false
-}:
+}@pkgs:
 
 let
   src' =
@@ -99,7 +100,7 @@ stdenv.mkDerivation (rec {
 
   hardeningDisable = [ "format" ];
 
-  cmakeFlags = [
+  cmakeFlags = pkgs.cmakeFlags ++ [
     "-DLLDB_INCLUDE_TESTS=${if doCheck then "YES" else "NO"}"
     "-DLLVM_ENABLE_RTTI=OFF"
     "-DClang_DIR=${lib.getDev libclang}/lib/cmake"
