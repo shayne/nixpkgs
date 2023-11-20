@@ -18,6 +18,12 @@ import ./generic.nix args {
     hash = "sha256-3gBv1AqZElHW04q/E14H3vhLFmHEVao2KWhuZlAcHEM=";
   };
 
+  patches = [
+    # Backport alignment related panics from zig-master to 0.10.
+    # Upstream issue: https://github.com/ziglang/zig/issues/14559
+    ./003-0.12-page-size.patch
+  ];
+
   outputs = [ "out" "doc" ];
 
   cmakeFlags = [

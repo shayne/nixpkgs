@@ -1,0 +1,854 @@
+From 31a5e22874599909945eb5b788d5726b9d43718b Mon Sep 17 00:00:00 2001
+From: Tristan Ross <tristan.ross@midstall.com>
+Date: Mon, 2 Oct 2023 23:52:34 -0700
+Subject: [PATCH] Add runtime page_size
+
+---
+ lib/std/c.zig                              |  1 +
+ lib/std/heap.zig                           | 11 +++
+ lib/std/heap/PageAllocator.zig             | 17 ++---
+ lib/std/heap/general_purpose_allocator.zig | 82 +++++++++++-----------
+ lib/std/heap/sbrk_allocator.zig            |  7 +-
+ lib/std/mem.zig                            | 35 +++++----
+ lib/std/os/linux/arm-eabi.zig              | 24 +++++++
+ lib/std/os/linux/arm64.zig                 | 24 +++++++
+ lib/std/os/linux/mips.zig                  |  4 ++
+ lib/std/os/linux/mips64.zig                |  4 ++
+ lib/std/os/linux/powerpc.zig               |  4 ++
+ lib/std/os/linux/powerpc64.zig             |  4 ++
+ lib/std/os/linux/riscv64.zig               |  4 ++
+ lib/std/os/linux/sparc64.zig               |  4 ++
+ lib/std/os/linux/x86.zig                   |  1 +
+ lib/std/os/linux/x86_64.zig                | 24 +++++++
+ lib/std/start.zig                          |  2 +-
+ lib/std/target.zig                         | 13 ++++
+ lib/std/zig/CrossTarget.zig                |  5 ++
+ lib/std/zig/system/NativeTargetInfo.zig    |  2 +
+ src/Compilation.zig                        |  4 +-
+ 21 files changed, 207 insertions(+), 69 deletions(-)
+
+diff --git a/lib/std/c.zig b/lib/std/c.zig
+index 7d4a9b782fd0..445167378d2f 100644
+--- a/lib/std/c.zig
++++ b/lib/std/c.zig
+@@ -79,6 +79,7 @@ pub usingnamespace switch (builtin.os.tag) {
+         pub extern "c" fn getrusage(who: c_int, usage: *c.rusage) c_int;
+ 
+         pub extern "c" fn sched_yield() c_int;
++        pub extern "c" fn sysconf(sc: c_int) c_long;
+ 
+         pub extern "c" fn sigaction(sig: c_int, noalias act: ?*const c.Sigaction, noalias oact: ?*c.Sigaction) c_int;
+         pub extern "c" fn sigprocmask(how: c_int, noalias set: ?*const c.sigset_t, noalias oset: ?*c.sigset_t) c_int;
+diff --git a/lib/std/heap.zig b/lib/std/heap.zig
+index 0c61242e5619..98829875a146 100644
+--- a/lib/std/heap.zig
++++ b/lib/std/heap.zig
+@@ -578,6 +578,17 @@ pub fn StackFallbackAllocator(comptime size: usize) type {
+     };
+ }
+ 
++threadlocal var page_size: ?usize = null;
++
++pub fn pageSize() usize {
++    if (page_size) |pg_size| return pg_size;
++    page_size = switch (builtin.os.tag) {
++        .linux => if (builtin.link_libc) @intCast(std.c.sysconf(std.os.linux.SC.PAGESIZE)) else std.os.linux.getauxval(std.elf.AT_PAGESZ),
++        else => mem.page_size,
++    };
++    return page_size.?;
++}
++
+ test "c_allocator" {
+     if (builtin.link_libc) {
+         try testAllocator(c_allocator);
+diff --git a/lib/std/heap/PageAllocator.zig b/lib/std/heap/PageAllocator.zig
+index 3e92aa5eec33..abf783413261 100644
+--- a/lib/std/heap/PageAllocator.zig
++++ b/lib/std/heap/PageAllocator.zig
+@@ -2,6 +2,7 @@ const std = @import("../std.zig");
+ const builtin = @import("builtin");
+ const Allocator = std.mem.Allocator;
+ const mem = std.mem;
++const heap = std.heap;
+ const os = std.os;
+ const maxInt = std.math.maxInt;
+ const assert = std.debug.assert;
+@@ -16,8 +17,8 @@ fn alloc(_: *anyopaque, n: usize, log2_align: u8, ra: usize) ?[*]u8 {
+     _ = ra;
+     _ = log2_align;
+     assert(n > 0);
+-    if (n > maxInt(usize) - (mem.page_size - 1)) return null;
+-    const aligned_len = mem.alignForward(usize, n, mem.page_size);
++    if (n > maxInt(usize) - (heap.pageSize() - 1)) return null;
++    const aligned_len = mem.alignForward(usize, n, heap.pageSize());
+ 
+     if (builtin.os.tag == .windows) {
+         const w = os.windows;
+@@ -39,7 +40,7 @@ fn alloc(_: *anyopaque, n: usize, log2_align: u8, ra: usize) ?[*]u8 {
+         -1,
+         0,
+     ) catch return null;
+-    assert(mem.isAligned(@intFromPtr(slice.ptr), mem.page_size));
++    assert(mem.isAligned(@intFromPtr(slice.ptr), heap.pageSize()));
+     const new_hint: [*]align(mem.page_size) u8 = @alignCast(slice.ptr + aligned_len);
+     _ = @cmpxchgStrong(@TypeOf(std.heap.next_mmap_addr_hint), &std.heap.next_mmap_addr_hint, hint, new_hint, .Monotonic, .Monotonic);
+     return slice.ptr;
+@@ -54,14 +55,14 @@ fn resize(
+ ) bool {
+     _ = log2_buf_align;
+     _ = return_address;
+-    const new_size_aligned = mem.alignForward(usize, new_size, mem.page_size);
++    const new_size_aligned = mem.alignForward(usize, new_size, heap.pageSize());
+ 
+     if (builtin.os.tag == .windows) {
+         const w = os.windows;
+         if (new_size <= buf_unaligned.len) {
+             const base_addr = @intFromPtr(buf_unaligned.ptr);
+             const old_addr_end = base_addr + buf_unaligned.len;
+-            const new_addr_end = mem.alignForward(usize, base_addr + new_size, mem.page_size);
++            const new_addr_end = mem.alignForward(usize, base_addr + new_size, heap.pageSize());
+             if (old_addr_end > new_addr_end) {
+                 // For shrinking that is not releasing, we will only
+                 // decommit the pages not needed anymore.
+@@ -73,14 +74,14 @@ fn resize(
+             }
+             return true;
+         }
+-        const old_size_aligned = mem.alignForward(usize, buf_unaligned.len, mem.page_size);
++        const old_size_aligned = mem.alignForward(usize, buf_unaligned.len, heap.pageSize());
+         if (new_size_aligned <= old_size_aligned) {
+             return true;
+         }
+         return false;
+     }
+ 
+-    const buf_aligned_len = mem.alignForward(usize, buf_unaligned.len, mem.page_size);
++    const buf_aligned_len = mem.alignForward(usize, buf_unaligned.len, heap.pageSize());
+     if (new_size_aligned == buf_aligned_len)
+         return true;
+ 
+@@ -103,7 +104,7 @@ fn free(_: *anyopaque, slice: []u8, log2_buf_align: u8, return_address: usize) v
+     if (builtin.os.tag == .windows) {
+         os.windows.VirtualFree(slice.ptr, 0, os.windows.MEM_RELEASE);
+     } else {
+-        const buf_aligned_len = mem.alignForward(usize, slice.len, mem.page_size);
++        const buf_aligned_len = mem.alignForward(usize, slice.len, heap.pageSize());
+         os.munmap(@alignCast(slice.ptr[0..buf_aligned_len]));
+     }
+ }
+diff --git a/lib/std/heap/general_purpose_allocator.zig b/lib/std/heap/general_purpose_allocator.zig
+index 6dc6df399811..da4618fc76ad 100644
+--- a/lib/std/heap/general_purpose_allocator.zig
++++ b/lib/std/heap/general_purpose_allocator.zig
+@@ -195,7 +195,7 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
+ 
+         pub const Error = mem.Allocator.Error;
+ 
+-        const small_bucket_count = math.log2(page_size);
++        const small_bucket_count = math.log2(std.mem.page_size);
+         const largest_bucket_object_size = 1 << (small_bucket_count - 1);
+         const LargestSizeClassInt = std.math.IntFittingRange(0, largest_bucket_object_size);
+ 
+@@ -262,14 +262,14 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
+                 if (!config.safety) @compileError("requested size is only stored when safety is enabled");
+                 const start_ptr = @as([*]u8, @ptrCast(bucket)) + bucketRequestedSizesStart(size_class);
+                 const sizes = @as([*]LargestSizeClassInt, @ptrCast(@alignCast(start_ptr)));
+-                const slot_count = @divExact(page_size, size_class);
++                const slot_count = @divExact(std.heap.pageSize(), size_class);
+                 return sizes[0..slot_count];
+             }
+ 
+             fn log2PtrAligns(bucket: *BucketHeader, size_class: usize) []u8 {
+                 if (!config.safety) @compileError("requested size is only stored when safety is enabled");
+                 const aligns_ptr = @as([*]u8, @ptrCast(bucket)) + bucketAlignsStart(size_class);
+-                const slot_count = @divExact(page_size, size_class);
++                const slot_count = @divExact(std.heap.pageSize(), size_class);
+                 return aligns_ptr[0..slot_count];
+             }
+ 
+@@ -338,13 +338,13 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
+ 
+         fn bucketAlignsStart(size_class: usize) usize {
+             if (!config.safety) @compileError("requested sizes are not stored unless safety is enabled");
+-            const slot_count = @divExact(page_size, size_class);
++            const slot_count = @divExact(std.heap.pageSize(), size_class);
+             return bucketRequestedSizesStart(size_class) + (@sizeOf(LargestSizeClassInt) * slot_count);
+         }
+ 
+         fn bucketStackFramesStart(size_class: usize) usize {
+             const unaligned_start = if (config.safety) blk: {
+-                const slot_count = @divExact(page_size, size_class);
++                const slot_count = @divExact(std.heap.pageSize(), size_class);
+                 break :blk bucketAlignsStart(size_class) + slot_count;
+             } else @sizeOf(BucketHeader) + usedBitsCount(size_class);
+             return mem.alignForward(
+@@ -355,12 +355,12 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
+         }
+ 
+         fn bucketSize(size_class: usize) usize {
+-            const slot_count = @divExact(page_size, size_class);
++            const slot_count = @divExact(std.heap.pageSize(), size_class);
+             return bucketStackFramesStart(size_class) + one_trace_size * traces_per_slot * slot_count;
+         }
+ 
+         fn usedBitsCount(size_class: usize) usize {
+-            const slot_count = @divExact(page_size, size_class);
++            const slot_count = @divExact(std.heap.pageSize(), size_class);
+             if (slot_count < 8) return 1;
+             return @divExact(slot_count, 8);
+         }
+@@ -444,10 +444,10 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
+                     var bucket = node.key;
+                     if (config.never_unmap) {
+                         // free page that was intentionally leaked by never_unmap
+-                        self.backing_allocator.free(bucket.page[0..page_size]);
++                        self.backing_allocator.free(bucket.page[0..std.heap.pageSize()]);
+                     }
+                     // alloc_cursor was set to slot count when bucket added to empty_buckets
+-                    self.freeBucket(bucket, @divExact(page_size, bucket.alloc_cursor));
++                    self.freeBucket(bucket, @divExact(std.heap.pageSize(), bucket.alloc_cursor));
+                     self.bucket_node_pool.destroy(node);
+                 }
+                 self.empty_buckets.root = null;
+@@ -510,7 +510,7 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
+         fn allocSlot(self: *Self, size_class: usize, trace_addr: usize) Error!Slot {
+             const bucket_index = math.log2(size_class);
+             var buckets = &self.buckets[bucket_index];
+-            const slot_count = @divExact(page_size, size_class);
++            const slot_count = @divExact(std.heap.pageSize(), size_class);
+             if (self.cur_buckets[bucket_index] == null or self.cur_buckets[bucket_index].?.alloc_cursor == slot_count) {
+                 var new_bucket = try self.createBucket(size_class);
+                 errdefer self.freeBucket(new_bucket, size_class);
+@@ -543,7 +543,7 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
+             addr: usize,
+             current_bucket: ?*BucketHeader,
+         ) ?*BucketHeader {
+-            const search_page: [*]align(page_size) u8 = @ptrFromInt(mem.alignBackward(usize, addr, page_size));
++            const search_page: [*]align(page_size) u8 = @ptrFromInt(mem.alignBackward(usize, addr, std.heap.pageSize()));
+             if (current_bucket != null and current_bucket.?.page == search_page) {
+                 return current_bucket;
+             }
+@@ -921,14 +921,14 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
+                     self.cur_buckets[bucket_index] = null;
+                 }
+                 if (!config.never_unmap) {
+-                    self.backing_allocator.free(bucket.page[0..page_size]);
++                    self.backing_allocator.free(bucket.page[0..std.heap.pageSize()]);
+                 }
+                 if (!config.retain_metadata) {
+                     self.freeBucket(bucket, size_class);
+                     self.bucket_node_pool.destroy(node);
+                 } else {
+                     // move alloc_cursor to end so we can tell size_class later
+-                    const slot_count = @divExact(page_size, size_class);
++                    const slot_count = @divExact(std.heap.pageSize(), size_class);
+                     bucket.alloc_cursor = @as(SlotIndex, @truncate(slot_count));
+                     var empty_entry = self.empty_buckets.getEntryFor(node.key);
+                     empty_entry.set(node);
+@@ -1012,7 +1012,7 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
+         }
+ 
+         fn createBucket(self: *Self, size_class: usize) Error!*BucketHeader {
+-            const page = try self.backing_allocator.alignedAlloc(u8, page_size, page_size);
++            const page = try self.backing_allocator.alignedAlloc(u8, std.mem.page_size, std.heap.pageSize());
+             errdefer self.backing_allocator.free(page);
+ 
+             const bucket_size = bucketSize(size_class);
+@@ -1152,17 +1152,17 @@ test "large object - grow" {
+     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+     const allocator = gpa.allocator();
+ 
+-    var slice1 = try allocator.alloc(u8, page_size * 2 - 20);
++    var slice1 = try allocator.alloc(u8, std.heap.pageSize() * 2 - 20);
+     defer allocator.free(slice1);
+ 
+     const old = slice1;
+-    slice1 = try allocator.realloc(slice1, page_size * 2 - 10);
++    slice1 = try allocator.realloc(slice1, std.heap.pageSize() * 2 - 10);
+     try std.testing.expect(slice1.ptr == old.ptr);
+ 
+-    slice1 = try allocator.realloc(slice1, page_size * 2);
++    slice1 = try allocator.realloc(slice1, std.heap.pageSize() * 2);
+     try std.testing.expect(slice1.ptr == old.ptr);
+ 
+-    slice1 = try allocator.realloc(slice1, page_size * 2 + 1);
++    slice1 = try allocator.realloc(slice1, std.heap.pageSize() * 2 + 1);
+ }
+ 
+ test "realloc small object to large object" {
+@@ -1176,7 +1176,7 @@ test "realloc small object to large object" {
+     slice[60] = 0x34;
+ 
+     // This requires upgrading to a large object
+-    const large_object_size = page_size * 2 + 50;
++    const large_object_size = std.heap.pageSize() * 2 + 50;
+     slice = try allocator.realloc(slice, large_object_size);
+     try std.testing.expect(slice[0] == 0x12);
+     try std.testing.expect(slice[60] == 0x34);
+@@ -1187,22 +1187,22 @@ test "shrink large object to large object" {
+     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+     const allocator = gpa.allocator();
+ 
+-    var slice = try allocator.alloc(u8, page_size * 2 + 50);
++    var slice = try allocator.alloc(u8, std.heap.pageSize() * 2 + 50);
+     defer allocator.free(slice);
+     slice[0] = 0x12;
+     slice[60] = 0x34;
+ 
+-    if (!allocator.resize(slice, page_size * 2 + 1)) return;
+-    slice = slice.ptr[0 .. page_size * 2 + 1];
++    if (!allocator.resize(slice, std.heap.pageSize() * 2 + 1)) return;
++    slice = slice.ptr[0 .. std.heap.pageSize() * 2 + 1];
+     try std.testing.expect(slice[0] == 0x12);
+     try std.testing.expect(slice[60] == 0x34);
+ 
+-    try std.testing.expect(allocator.resize(slice, page_size * 2 + 1));
+-    slice = slice[0 .. page_size * 2 + 1];
++    try std.testing.expect(allocator.resize(slice, std.heap.pageSize() * 2 + 1));
++    slice = slice[0 .. std.heap.pageSize() * 2 + 1];
+     try std.testing.expect(slice[0] == 0x12);
+     try std.testing.expect(slice[60] == 0x34);
+ 
+-    slice = try allocator.realloc(slice, page_size * 2);
++    slice = try allocator.realloc(slice, std.heap.pageSize() * 2);
+     try std.testing.expect(slice[0] == 0x12);
+     try std.testing.expect(slice[60] == 0x34);
+ }
+@@ -1216,13 +1216,13 @@ test "shrink large object to large object with larger alignment" {
+     var fba = std.heap.FixedBufferAllocator.init(&debug_buffer);
+     const debug_allocator = fba.allocator();
+ 
+-    const alloc_size = page_size * 2 + 50;
++    const alloc_size = std.heap.pageSize() * 2 + 50;
+     var slice = try allocator.alignedAlloc(u8, 16, alloc_size);
+     defer allocator.free(slice);
+ 
+     const big_alignment: usize = switch (builtin.os.tag) {
+-        .windows => page_size * 32, // Windows aligns to 64K.
+-        else => page_size * 2,
++        .windows => std.heap.pageSize() * 32, // Windows aligns to 64K.
++        else => std.heap.pageSize() * 2,
+     };
+     // This loop allocates until we find a page that is not aligned to the big
+     // alignment. Then we shrink the allocation after the loop, but increase the
+@@ -1248,7 +1248,7 @@ test "realloc large object to small object" {
+     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+     const allocator = gpa.allocator();
+ 
+-    var slice = try allocator.alloc(u8, page_size * 2 + 50);
++    var slice = try allocator.alloc(u8, std.heap.pageSize() * 2 + 50);
+     defer allocator.free(slice);
+     slice[0] = 0x12;
+     slice[16] = 0x34;
+@@ -1288,18 +1288,18 @@ test "realloc large object to larger alignment" {
+     var fba = std.heap.FixedBufferAllocator.init(&debug_buffer);
+     const debug_allocator = fba.allocator();
+ 
+-    var slice = try allocator.alignedAlloc(u8, 16, page_size * 2 + 50);
++    var slice = try allocator.alignedAlloc(u8, 16, std.heap.pageSize() * 2 + 50);
+     defer allocator.free(slice);
+ 
+     const big_alignment: usize = switch (builtin.os.tag) {
+-        .windows => page_size * 32, // Windows aligns to 64K.
+-        else => page_size * 2,
++        .windows => std.heap.pageSize() * 32, // Windows aligns to 64K.
++        else => std.heap.pageSize() * 2,
+     };
+     // This loop allocates until we find a page that is not aligned to the big alignment.
+     var stuff_to_free = std.ArrayList([]align(16) u8).init(debug_allocator);
+     while (mem.isAligned(@intFromPtr(slice.ptr), big_alignment)) {
+         try stuff_to_free.append(slice);
+-        slice = try allocator.alignedAlloc(u8, 16, page_size * 2 + 50);
++        slice = try allocator.alignedAlloc(u8, 16, std.heap.pageSize() * 2 + 50);
+     }
+     while (stuff_to_free.popOrNull()) |item| {
+         allocator.free(item);
+@@ -1307,15 +1307,15 @@ test "realloc large object to larger alignment" {
+     slice[0] = 0x12;
+     slice[16] = 0x34;
+ 
+-    slice = try allocator.reallocAdvanced(slice, 32, page_size * 2 + 100);
++    slice = try allocator.reallocAdvanced(slice, 32, std.heap.pageSize() * 2 + 100);
+     try std.testing.expect(slice[0] == 0x12);
+     try std.testing.expect(slice[16] == 0x34);
+ 
+-    slice = try allocator.reallocAdvanced(slice, 32, page_size * 2 + 25);
++    slice = try allocator.reallocAdvanced(slice, 32, std.heap.pageSize() * 2 + 25);
+     try std.testing.expect(slice[0] == 0x12);
+     try std.testing.expect(slice[16] == 0x34);
+ 
+-    slice = try allocator.reallocAdvanced(slice, big_alignment, page_size * 2 + 100);
++    slice = try allocator.reallocAdvanced(slice, big_alignment, std.heap.pageSize() * 2 + 100);
+     try std.testing.expect(slice[0] == 0x12);
+     try std.testing.expect(slice[16] == 0x34);
+ }
+@@ -1326,7 +1326,7 @@ test "large object shrinks to small but allocation fails during shrink" {
+     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+     const allocator = gpa.allocator();
+ 
+-    var slice = try allocator.alloc(u8, page_size * 2 + 50);
++    var slice = try allocator.alloc(u8, std.heap.pageSize() * 2 + 50);
+     defer allocator.free(slice);
+     slice[0] = 0x12;
+     slice[3] = 0x34;
+@@ -1397,7 +1397,7 @@ test "double frees" {
+     try std.testing.expect(GPA.searchBucket(&gpa.empty_buckets, @intFromPtr(small.ptr), null) != null);
+ 
+     // detect a large allocation double free
+-    const large = try allocator.alloc(u8, 2 * page_size);
++    const large = try allocator.alloc(u8, 2 * std.heap.pageSize());
+     try std.testing.expect(gpa.large_allocations.contains(@intFromPtr(large.ptr)));
+     try std.testing.expectEqual(gpa.large_allocations.getEntry(@intFromPtr(large.ptr)).?.value_ptr.bytes, large);
+     allocator.free(large);
+@@ -1406,7 +1406,7 @@ test "double frees" {
+ 
+     const normal_small = try allocator.alloc(u8, size_class);
+     defer allocator.free(normal_small);
+-    const normal_large = try allocator.alloc(u8, 2 * page_size);
++    const normal_large = try allocator.alloc(u8, 2 * std.heap.pageSize());
+     defer allocator.free(normal_large);
+ 
+     // check that flushing retained metadata doesn't disturb live allocations
+@@ -1422,8 +1422,8 @@ test "bug 9995 fix, large allocs count requested size not backing size" {
+     var gpa = GeneralPurposeAllocator(.{ .enable_memory_limit = true }){};
+     const allocator = gpa.allocator();
+ 
+-    var buf = try allocator.alignedAlloc(u8, 1, page_size + 1);
+-    try std.testing.expect(gpa.total_requested_bytes == page_size + 1);
++    var buf = try allocator.alignedAlloc(u8, 1, std.heap.pageSize() + 1);
++    try std.testing.expect(gpa.total_requested_bytes == std.heap.pageSize() + 1);
+     buf = try allocator.realloc(buf, 1);
+     try std.testing.expect(gpa.total_requested_bytes == 1);
+     buf = try allocator.realloc(buf, 2);
+diff --git a/lib/std/heap/sbrk_allocator.zig b/lib/std/heap/sbrk_allocator.zig
+index 3ccc2dddf7f3..833fc8c996cb 100644
+--- a/lib/std/heap/sbrk_allocator.zig
++++ b/lib/std/heap/sbrk_allocator.zig
+@@ -3,6 +3,7 @@ const builtin = @import("builtin");
+ const math = std.math;
+ const Allocator = std.mem.Allocator;
+ const mem = std.mem;
++const heap = std.heap;
+ const assert = std.debug.assert;
+ 
+ pub fn SbrkAllocator(comptime sbrk: *const fn (n: usize) usize) type {
+@@ -20,7 +21,7 @@ pub fn SbrkAllocator(comptime sbrk: *const fn (n: usize) usize) type {
+         const max_usize = math.maxInt(usize);
+         const ushift = math.Log2Int(usize);
+         const bigpage_size = 64 * 1024;
+-        const pages_per_bigpage = bigpage_size / mem.page_size;
++        const pages_per_bigpage = bigpage_size / heap.pageSize();
+         const bigpage_count = max_usize / bigpage_size;
+ 
+         /// Because of storing free list pointers, the minimum size class is 3.
+@@ -60,7 +61,7 @@ pub fn SbrkAllocator(comptime sbrk: *const fn (n: usize) usize) type {
+                     }
+ 
+                     const next_addr = next_addrs[class];
+-                    if (next_addr % mem.page_size == 0) {
++                    if (next_addr % heap.pageSize() == 0) {
+                         const addr = allocBigPages(1);
+                         if (addr == 0) return null;
+                         //std.debug.print("allocated fresh slot_size={d} class={d} addr=0x{x}\n", .{
+@@ -155,7 +156,7 @@ pub fn SbrkAllocator(comptime sbrk: *const fn (n: usize) usize) type {
+                 big_frees[class] = node.*;
+                 return top_free_ptr;
+             }
+-            return sbrk(pow2_pages * pages_per_bigpage * mem.page_size);
++            return sbrk(pow2_pages * pages_per_bigpage * heap.pageSize());
+         }
+     };
+ }
+diff --git a/lib/std/mem.zig b/lib/std/mem.zig
+index 73fe2e77577c..1cd43f22af82 100644
+--- a/lib/std/mem.zig
++++ b/lib/std/mem.zig
+@@ -12,14 +12,19 @@ const native_endian = builtin.cpu.arch.endian();
+ 
+ /// Compile time known minimum page size.
+ /// https://github.com/ziglang/zig/issues/4082
+-pub const page_size = switch (builtin.cpu.arch) {
+-    .wasm32, .wasm64 => 64 * 1024,
+-    .aarch64 => switch (builtin.os.tag) {
+-        .macos, .ios, .watchos, .tvos => 16 * 1024,
++pub const page_size = blk: {
++    const value = builtin.target.page_size orelse switch (builtin.cpu.arch) {
++        .wasm32, .wasm64 => 64 * 1024,
++        .aarch64 => switch (builtin.os.tag) {
++            .macos, .ios, .watchos, .tvos => 16 * 1024,
++            else => 4 * 1024,
++        },
++        .sparc64 => 8 * 1024,
+         else => 4 * 1024,
+-    },
+-    .sparc64 => 8 * 1024,
+-    else => 4 * 1024,
++    };
++
++    if (value == 0) @compileError("Page size is not valid");
++    break :blk value;
+ };
+ 
+ /// The standard library currently thoroughly depends on byte size
+@@ -975,14 +980,14 @@ pub fn indexOfSentinel(comptime T: type, comptime sentinel: T, p: [*:sentinel]co
+             // as we don't read into a new page. This should be the case for most architectures
+             // which use paged memory, however should be confirmed before adding a new arch below.
+             .aarch64, .x86, .x86_64 => if (std.simd.suggestVectorSize(T)) |block_len| {
+-                comptime std.debug.assert(std.mem.page_size % block_len == 0);
++                std.debug.assert(std.heap.pageSize() % block_len == 0);
+                 const Block = @Vector(block_len, T);
+                 const mask: Block = @splat(sentinel);
+ 
+                 // First block may be unaligned
+                 const start_addr = @intFromPtr(&p[i]);
+-                const offset_in_page = start_addr & (std.mem.page_size - 1);
+-                if (offset_in_page < std.mem.page_size - block_len) {
++                const offset_in_page = start_addr & (std.heap.pageSize() - 1);
++                if (offset_in_page < std.heap.pageSize() - block_len) {
+                     // Will not read past the end of a page, full block.
+                     const block: Block = p[i..][0..block_len].*;
+                     const matches = block == mask;
+@@ -1030,18 +1035,18 @@ test "indexOfSentinel vector paths" {
+         const block_len = std.simd.suggestVectorSize(T) orelse continue;
+ 
+         // Allocate three pages so we guarantee a page-crossing address with a full page after
+-        const memory = try allocator.alloc(T, 3 * std.mem.page_size / @sizeOf(T));
++        const memory = try allocator.alloc(T, 3 * std.heap.pageSize() / @sizeOf(T));
+         defer allocator.free(memory);
+         @memset(memory, 0xaa);
+ 
+         // Find starting page-alignment = 0
+         var start: usize = 0;
+         const start_addr = @intFromPtr(&memory);
+-        start += (std.mem.alignForward(usize, start_addr, std.mem.page_size) - start_addr) / @sizeOf(T);
+-        try testing.expect(start < std.mem.page_size / @sizeOf(T));
++        start += (std.mem.alignForward(usize, start_addr, std.heap.pageSize()) - start_addr) / @sizeOf(T);
++        try testing.expect(start < std.heap.pageSize() / @sizeOf(T));
+ 
+         // Validate all sub-block alignments
+-        const search_len = std.mem.page_size / @sizeOf(T);
++        const search_len = std.heap.pageSize() / @sizeOf(T);
+         memory[start + search_len] = 0;
+         for (0..block_len) |offset| {
+             try testing.expectEqual(search_len - offset, indexOfSentinel(T, 0, @ptrCast(&memory[start + offset])));
+@@ -1049,7 +1054,7 @@ test "indexOfSentinel vector paths" {
+         memory[start + search_len] = 0xaa;
+ 
+         // Validate page boundary crossing
+-        const start_page_boundary = start + (std.mem.page_size / @sizeOf(T));
++        const start_page_boundary = start + (std.heap.pageSize() / @sizeOf(T));
+         memory[start_page_boundary + block_len] = 0;
+         for (0..block_len) |offset| {
+             try testing.expectEqual(2 * block_len - offset, indexOfSentinel(T, 0, @ptrCast(&memory[start_page_boundary - block_len + offset])));
+diff --git a/lib/std/os/linux/arm-eabi.zig b/lib/std/os/linux/arm-eabi.zig
+index f4870dccbb9e..1d79f954786e 100644
+--- a/lib/std/os/linux/arm-eabi.zig
++++ b/lib/std/os/linux/arm-eabi.zig
+@@ -356,3 +356,27 @@ pub const ucontext_t = extern struct {
+ };
+ 
+ pub const Elf_Symndx = u32;
++
++pub const SC = struct {
++    pub const socket = 1;
++    pub const bind = 2;
++    pub const connect = 3;
++    pub const listen = 4;
++    pub const accept = 5;
++    pub const getsockname = 6;
++    pub const getpeername = 7;
++    pub const socketpair = 8;
++    pub const send = 9;
++    pub const recv = 10;
++    pub const sendto = 11;
++    pub const recvfrom = 12;
++    pub const shutdown = 13;
++    pub const setsockopt = 14;
++    pub const getsockopt = 15;
++    pub const sendmsg = 16;
++    pub const recvmsg = 17;
++    pub const accept4 = 18;
++    pub const recvmmsg = 19;
++    pub const sendmmsg = 20;
++    pub const PAGESIZE = 30;
++};
+diff --git a/lib/std/os/linux/arm64.zig b/lib/std/os/linux/arm64.zig
+index b87e77430607..77f3bc644c15 100644
+--- a/lib/std/os/linux/arm64.zig
++++ b/lib/std/os/linux/arm64.zig
+@@ -301,3 +301,27 @@ pub const ucontext_t = extern struct {
+ };
+ 
+ pub const Elf_Symndx = u32;
++
++pub const SC = struct {
++    pub const socket = 1;
++    pub const bind = 2;
++    pub const connect = 3;
++    pub const listen = 4;
++    pub const accept = 5;
++    pub const getsockname = 6;
++    pub const getpeername = 7;
++    pub const socketpair = 8;
++    pub const send = 9;
++    pub const recv = 10;
++    pub const sendto = 11;
++    pub const recvfrom = 12;
++    pub const shutdown = 13;
++    pub const setsockopt = 14;
++    pub const getsockopt = 15;
++    pub const sendmsg = 16;
++    pub const recvmsg = 17;
++    pub const accept4 = 18;
++    pub const recvmmsg = 19;
++    pub const sendmmsg = 20;
++    pub const PAGESIZE = 30;
++};
+diff --git a/lib/std/os/linux/mips.zig b/lib/std/os/linux/mips.zig
+index cfb2d73bfd23..9dd99824a941 100644
+--- a/lib/std/os/linux/mips.zig
++++ b/lib/std/os/linux/mips.zig
+@@ -428,3 +428,7 @@ pub const rlimit_resource = enum(c_int) {
+ 
+     _,
+ };
++
++pub const SC = struct {
++    pub const PAGESIZE = 30;
++};
+diff --git a/lib/std/os/linux/mips64.zig b/lib/std/os/linux/mips64.zig
+index d98611097964..017837e4d5cb 100644
+--- a/lib/std/os/linux/mips64.zig
++++ b/lib/std/os/linux/mips64.zig
+@@ -413,3 +413,7 @@ pub const rlimit_resource = enum(c_int) {
+ 
+     _,
+ };
++
++pub const SC = struct {
++    pub const PAGESIZE = 30;
++};
+diff --git a/lib/std/os/linux/powerpc.zig b/lib/std/os/linux/powerpc.zig
+index 87feba3f0ab0..0f1a2a58ebe5 100644
+--- a/lib/std/os/linux/powerpc.zig
++++ b/lib/std/os/linux/powerpc.zig
+@@ -326,3 +326,7 @@ pub const ucontext_t = extern struct {
+ pub const Elf_Symndx = u32;
+ 
+ pub const MMAP2_UNIT = 4096;
++
++pub const SC = struct {
++    pub const PAGESIZE = 30;
++};
+diff --git a/lib/std/os/linux/powerpc64.zig b/lib/std/os/linux/powerpc64.zig
+index dc142abc4f12..20642704873d 100644
+--- a/lib/std/os/linux/powerpc64.zig
++++ b/lib/std/os/linux/powerpc64.zig
+@@ -334,3 +334,7 @@ pub const ucontext_t = extern struct {
+ };
+ 
+ pub const Elf_Symndx = u32;
++
++pub const SC = struct {
++    pub const PAGESIZE = 30;
++};
+diff --git a/lib/std/os/linux/riscv64.zig b/lib/std/os/linux/riscv64.zig
+index 473cab7b317e..f14a999a4026 100644
+--- a/lib/std/os/linux/riscv64.zig
++++ b/lib/std/os/linux/riscv64.zig
+@@ -247,3 +247,7 @@ pub const Elf_Symndx = u32;
+ 
+ pub const VDSO = struct {};
+ pub const MAP = struct {};
++
++pub const SC = struct {
++    pub const PAGESIZE = 30;
++};
+diff --git a/lib/std/os/linux/sparc64.zig b/lib/std/os/linux/sparc64.zig
+index c741df989777..2859a0de2cbb 100644
+--- a/lib/std/os/linux/sparc64.zig
++++ b/lib/std/os/linux/sparc64.zig
+@@ -507,3 +507,7 @@ pub const rlimit_resource = enum(c_int) {
+ 
+     _,
+ };
++
++pub const SC = struct {
++    pub const PAGESIZE = 30;
++};
+diff --git a/lib/std/os/linux/x86.zig b/lib/std/os/linux/x86.zig
+index 721fdecb828b..d2bc08d590e7 100644
+--- a/lib/std/os/linux/x86.zig
++++ b/lib/std/os/linux/x86.zig
+@@ -385,6 +385,7 @@ pub const SC = struct {
+     pub const accept4 = 18;
+     pub const recvmmsg = 19;
+     pub const sendmmsg = 20;
++    pub const PAGESIZE = 30;
+ };
+ 
+ fn gpRegisterOffset(comptime reg_index: comptime_int) usize {
+diff --git a/lib/std/os/linux/x86_64.zig b/lib/std/os/linux/x86_64.zig
+index ce8e1133ae91..a3e163d7ef6c 100644
+--- a/lib/std/os/linux/x86_64.zig
++++ b/lib/std/os/linux/x86_64.zig
+@@ -489,3 +489,27 @@ pub inline fn getcontext(context: *ucontext_t) usize {
+         : "cc", "memory", "rcx", "rdx", "rsi", "r8", "r10", "r11"
+     );
+ }
++
++pub const SC = struct {
++    pub const socket = 1;
++    pub const bind = 2;
++    pub const connect = 3;
++    pub const listen = 4;
++    pub const accept = 5;
++    pub const getsockname = 6;
++    pub const getpeername = 7;
++    pub const socketpair = 8;
++    pub const send = 9;
++    pub const recv = 10;
++    pub const sendto = 11;
++    pub const recvfrom = 12;
++    pub const shutdown = 13;
++    pub const setsockopt = 14;
++    pub const getsockopt = 15;
++    pub const sendmsg = 16;
++    pub const recvmsg = 17;
++    pub const accept4 = 18;
++    pub const recvmmsg = 19;
++    pub const sendmmsg = 20;
++    pub const PAGESIZE = 30;
++};
+diff --git a/lib/std/start.zig b/lib/std/start.zig
+index ff21ed8187be..d85c6b74150c 100644
+--- a/lib/std/start.zig
++++ b/lib/std/start.zig
+@@ -429,7 +429,7 @@ fn expandStackSize(phdrs: []elf.Phdr) void {
+     for (phdrs) |*phdr| {
+         switch (phdr.p_type) {
+             elf.PT_GNU_STACK => {
+-                assert(phdr.p_memsz % std.mem.page_size == 0);
++                assert(phdr.p_memsz % std.heap.pageSize() == 0);
+ 
+                 // Silently fail if we are unable to get limits.
+                 const limits = std.os.getrlimit(.STACK) catch break;
+diff --git a/lib/std/target.zig b/lib/std/target.zig
+index 3764b71d8fa6..4080957d902c 100644
+--- a/lib/std/target.zig
++++ b/lib/std/target.zig
+@@ -8,6 +8,7 @@ pub const Target = struct {
+     os: Os,
+     abi: Abi,
+     ofmt: ObjectFormat,
++    page_size: ?usize = null,
+ 
+     pub const Os = struct {
+         tag: Tag,
+@@ -456,6 +457,10 @@ pub const Target = struct {
+                 => false,
+             };
+         }
++
++        pub fn compare(self: Os, other: Os) bool {
++            return self.tag == other.tag and self.isAtLeast(other.tag, other.getVersionRange());
++        }
+     };
+ 
+     pub const aarch64 = @import("target/aarch64.zig");
+@@ -1392,8 +1397,16 @@ pub const Target = struct {
+         pub fn baseline(arch: Arch) Cpu {
+             return Model.baseline(arch).toCpu(arch);
+         }
++
++        pub fn compare(self: Cpu, other: Cpu) bool {
++            return self.arch == other.arch and std.mem.eql(u8, self.model.name, other.model.name) and self.features.eql(other.features);
++        }
+     };
+ 
++    pub fn useHostPageSize(self: Target, other: Target) bool {
++        return self.cpu.compare(other.cpu) and self.os.compare(other.os);
++    }
++
+     pub fn zigTriple(self: Target, allocator: mem.Allocator) ![]u8 {
+         return std.zig.CrossTarget.fromTarget(self).zigTriple(allocator);
+     }
+diff --git a/lib/std/zig/CrossTarget.zig b/lib/std/zig/CrossTarget.zig
+index ea496051b4ca..b8139f0f18a6 100644
+--- a/lib/std/zig/CrossTarget.zig
++++ b/lib/std/zig/CrossTarget.zig
+@@ -45,6 +45,9 @@ dynamic_linker: DynamicLinker = DynamicLinker{},
+ /// `null` means default for the cpu/arch/os combo.
+ ofmt: ?Target.ObjectFormat = null,
+ 
++/// `null` means to dynamically get the page size or use the platform default.
++page_size: ?usize = null,
++
+ pub const CpuModel = union(enum) {
+     /// Always native
+     native,
+@@ -81,6 +84,7 @@ pub fn fromTarget(target: Target) CrossTarget {
+             target.os.version_range.linux.glibc
+         else
+             null,
++        .page_size = target.page_size,
+     };
+     result.updateOsVersionRange(target.os);
+ 
+@@ -177,6 +181,7 @@ pub fn toTarget(self: CrossTarget) Target {
+         .os = self.getOs(),
+         .abi = self.getAbi(),
+         .ofmt = self.getObjectFormat(),
++        .page_size = self.page_size,
+     };
+ }
+ 
+diff --git a/lib/std/zig/system/NativeTargetInfo.zig b/lib/std/zig/system/NativeTargetInfo.zig
+index ba0d699f915a..2e7b7bf0bf37 100644
+--- a/lib/std/zig/system/NativeTargetInfo.zig
++++ b/lib/std/zig/system/NativeTargetInfo.zig
+@@ -657,6 +657,7 @@ pub fn abiAndDynamicLinkerFromFile(
+             .os = os,
+             .abi = cross_target.abi orelse Target.Abi.default(cpu.arch, os),
+             .ofmt = cross_target.ofmt orelse Target.ObjectFormat.default(os.tag, cpu.arch),
++            .page_size = cross_target.page_size,
+         },
+         .dynamic_linker = cross_target.dynamic_linker,
+     };
+@@ -934,6 +935,7 @@ fn defaultAbiAndDynamicLinker(cpu: Target.Cpu, os: Target.Os, cross_target: Cros
+         .os = os,
+         .abi = cross_target.abi orelse Target.Abi.default(cpu.arch, os),
+         .ofmt = cross_target.ofmt orelse Target.ObjectFormat.default(os.tag, cpu.arch),
++        .page_size = cross_target.page_size,
+     };
+     return NativeTargetInfo{
+         .target = target,
+diff --git a/src/Compilation.zig b/src/Compilation.zig
+index 974861690eb0..81288cda03e2 100644
+--- a/src/Compilation.zig
++++ b/src/Compilation.zig
+@@ -6319,7 +6319,7 @@ fn zigBackend(target: std.Target, use_llvm: bool) std.builtin.CompilerBackend {
+     };
+ }
+ 
+-pub fn generateBuiltinZigSource(comp: *Compilation, allocator: Allocator) Allocator.Error![:0]u8 {
++pub fn generateBuiltinZigSource(comp: *Compilation, allocator: Allocator) error{ OutOfMemory, InvalidPageSize }![:0]u8 {
+     const tracy_trace = trace(@src());
+     defer tracy_trace.end();
+ 
+@@ -6467,6 +6467,7 @@ pub fn generateBuiltinZigSource(comp: *Compilation, allocator: Allocator) Alloca
+         \\    .os = os,
+         \\    .abi = abi,
+         \\    .ofmt = object_format,
++        \\    .page_size = {?},
+         \\}};
+         \\pub const object_format = std.Target.ObjectFormat.{};
+         \\pub const mode = std.builtin.OptimizeMode.{};
+@@ -6482,6 +6483,7 @@ pub fn generateBuiltinZigSource(comp: *Compilation, allocator: Allocator) Alloca
+         \\pub const omit_frame_pointer = {};
+         \\
+     , .{
++        target.page_size orelse (if (comp.bin_file.options.is_native_os and comp.bin_file.options.is_native_abi) std.heap.pageSize() else null),
+         std.zig.fmtId(@tagName(target.ofmt)),
+         std.zig.fmtId(@tagName(comp.bin_file.options.optimize_mode)),
+         link_libc,
